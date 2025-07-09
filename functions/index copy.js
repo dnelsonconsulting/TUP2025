@@ -1,3 +1,4 @@
+// functions/index.js
 const functions = require('firebase-functions');
 const Busboy = require('busboy');
 const { google } = require('googleapis');
@@ -6,212 +7,223 @@ const os = require('os');
 const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 
+// CONFIG: Replace with your real IDs
 const SPREADSHEET_ID = '1eOE98EMLJ56AAtFuXqQG5IqA4ABwyFLyqzoIbH7lHXg';
 const SHEET_NAME = 'Transcripts';
 const BASE_DRIVE_FOLDER_ID = '1uBtsAnQrwPMcb-BcYRfE5m_mNA7nTyyW';
 
 const REQUIRED_FIELDS = [
-    'FirstName', 'MiddleName', 'LastName', 'AdditionalName',
-    'StudentType', 'DegreeLevel', 'Gender', 'BirthDate',
-    'PersonalEmail', 'Notes', 'National_Country', 'T1_Country',
-    'T2_Country', 'T3_Country', 'T4_Country', 'Terms_Conditions'
+  "firstName", "lastName", "studentType", "degreeLevel", "gender",
+  "birthDate", "personalEmail", "nationalCountry", "t1Country",
+  "nationalCountryCode", "t1CountryCode"
 ];
-
-// You may want to align 'IDorTNum' with your front-end field. (No spaces/symbols.)
-
+const REQUIRED_FILES = ["nationalID", "transcript1"];
 const FILE_FIELDS_MAP = {
-    'NationalID': 'NationalID',
-    'Transcript1': 'T1',
-    'Transcript2': 'T2',
-    'Transcript3': 'T3',
-    'Transcript4': 'T4',
+  "nationalID": "ID",
+  "transcript1": "T1",
+  "transcript2": "T2",
+  "transcript3": "T3",
+  "transcript4": "T4"
 };
-const REQUIRED_FILE_FIELDS = Object.keys(FILE_FIELDS_MAP);
-const ACCURACY_CHECKBOX_FIELD = 'Terms_Conditions';
 
+// Google API Auth
 const auth = new google.auth.GoogleAuth({
-    scopes: [
-        'https://www.googleapis.com/auth/drive',
-        'https://www.googleapis.com/auth/spreadsheets'
-    ]
+  scopes: [
+    'https://www.googleapis.com/auth/drive',
+    'https://www.googleapis.com/auth/spreadsheets'
+  ]
 });
 
 function cleanupTempFiles(tempFilePaths) {
-    for (const filePath of tempFilePaths) {
-        if (fs.existsSync(filePath)) {
-            try { fs.unlinkSync(filePath); } catch (e) { }
-        }
+  for (const filePath of tempFilePaths) {
+    if (fs.existsSync(filePath)) {
+      try { fs.unlinkSync(filePath); } catch (e) { }
     }
+  }
 }
 
-exports.handleTranscriptSubmission = functions.https.onRequest(async (req, res) => {
-    if (req.method !== 'POST') {
-        return res.status(405).send('Method Not Allowed - Only POST requests are accepted');
+// Restructure the function to correctly handle the async stream from Busboy
+exports.handleTranscriptSubmission = functions.https.onRequest((req, res) => {
+  // --- CORS for local/dev and browser FE ---
+  res.set('Access-Control-Allow-Origin', '*');
+  res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  if (req.method === 'OPTIONS') {
+    res.status(204).send('');
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    res.status(405).send('Method Not Allowed');
+    return;
+  }
+
+  const busboy = Busboy({ headers: req.headers });
+  const fields = {};
+  const files = {};
+  const filePromises = [];
+  const tempFilePaths = [];
+  const tmpdir = os.tmpdir();
+
+  // This error handler is critical for catching parsing errors
+  busboy.on('error', err => {
+    console.error('Busboy error:', err);
+    cleanupTempFiles(tempFilePaths);
+    res.status(500).json({ error: 'Error parsing form data.' });
+  });
+
+  busboy.on('field', (fieldname, val) => { fields[fieldname] = val; });
+
+  busboy.on('file', (fieldname, fileStream, { filename, mimeType }) => {
+    if (!FILE_FIELDS_MAP[fieldname]) {
+      fileStream.resume();
+      return;
     }
+    const tempFileName = path.join(tmpdir, `upload_${uuidv4()}_${filename}`);
+    tempFilePaths.push(tempFileName);
+    const writeStream = fs.createWriteStream(tempFileName);
+    fileStream.pipe(writeStream);
 
-    const busboy = Busboy({ headers: req.headers });
-    const fields = {};
-    const filePromises = [];
-    const tmpdir = os.tmpdir();
-    const tempFilePaths = [];
-
-    busboy.on('field', (fieldname, val) => {
-        fields[fieldname] = val;
+    const filePromise = new Promise((resolve, reject) => {
+      writeStream.on('finish', () => {
+        files[fieldname] = {
+          filename,
+          mimetype: mimeType,
+          tempFilePath: tempFileName
+        };
+        resolve();
+      });
+      // Catch errors on both streams
+      fileStream.on('error', reject);
+      writeStream.on('error', reject);
     });
+    filePromises.push(filePromise);
+  });
 
-    busboy.on('file', (fieldname, fileStream, filename, info) => {
-        if (!FILE_FIELDS_MAP[fieldname]) {
-            fileStream.resume();
-            return;
+  busboy.on('finish', async () => {
+    try {
+      await Promise.all(filePromises);
+
+      // VALIDATION
+      for (const f of REQUIRED_FIELDS) {
+        if (!fields[f] || (typeof fields[f] === "string" && fields[f].trim() === "")) {
+          cleanupTempFiles(tempFilePaths);
+          res.status(400).json({ error: `Missing required field: ${f}` });
+          return;
         }
-        const tempFileName = path.join(tmpdir, `upload_${uuidv4()}_${filename}`);
-        tempFilePaths.push(tempFileName);
-        const writeStream = fs.createWriteStream(tempFileName);
-        fileStream.pipe(writeStream);
+      }
+      for (const f of REQUIRED_FILES) {
+        if (!files[f]) {
+          cleanupTempFiles(tempFilePaths);
+          res.status(400).json({ error: `Missing required file: ${f}` });
+          return;
+        }
+      }
+      if (fields.termsConditions !== "true" && fields.termsConditions !== true) {
+        cleanupTempFiles(tempFilePaths);
+        res.status(400).json({ error: `You must confirm accuracy.` });
+        return;
+      }
 
-        const filePromise = new Promise((resolve, reject) => {
-            fileStream.on('end', () => writeStream.end());
-            writeStream.on('finish', () => {
-                resolve({ fieldname, filename, mimetype: info.mimeType, tempFilePath: tempFileName });
-            });
-            fileStream.on('error', reject);
-            writeStream.on('error', reject);
+      // GOOGLE API
+      const authClient = await auth.getClient();
+      const drive = google.drive({ version: "v3", auth: authClient });
+      const sheets = google.sheets({ version: "v4", auth: authClient });
+
+      // CREATE/GET STUDENT FOLDER & FILENAME BASE
+      const folderName = [
+        fields.lastName,
+        fields.firstName,
+        fields.degreeLevel,
+        fields.studentType
+      ].filter(Boolean).join("_").replace(/[^a-zA-Z0-9_\-]/g, "_");
+
+      let folderId;
+      const search = await drive.files.list({
+        q: `name='${folderName}' and mimeType='application/vnd.google-apps.folder' and '${BASE_DRIVE_FOLDER_ID}' in parents`,
+        spaces: 'drive',
+        fields: 'files(id)'
+      });
+      if (search.data.files.length > 0) {
+        folderId = search.data.files[0].id;
+      } else {
+        const create = await drive.files.create({
+          resource: {
+            name: folderName,
+            mimeType: 'application/vnd.google-apps.folder',
+            parents: [BASE_DRIVE_FOLDER_ID]
+          },
+          fields: 'id'
         });
-        filePromises.push(filePromise);
-    });
+        folderId = create.data.id;
+      }
 
-    busboy.on('finish', async () => {
-        try {
-            const uploadedFilesInfo = await Promise.all(filePromises);
-
-            // Validation
-            for (const fieldName of REQUIRED_FIELDS) {
-                if (!fields[fieldName] || typeof fields[fieldName] === 'string' && fields[fieldName].trim() === '') {
-                    cleanupTempFiles(tempFilePaths);
-                    return res.status(400).send(`Missing or empty required field: ${fieldName}`);
-                }
-            }
-            if (uploadedFilesInfo.length !== REQUIRED_FILE_FIELDS.length) {
-                cleanupTempFiles(tempFilePaths);
-                return res.status(400).send(`Missing required files.`);
-            }
-            if (fields[ACCURACY_CHECKBOX_FIELD] !== 'true') {
-                cleanupTempFiles(tempFilePaths);
-                return res.status(400).send('You must confirm accuracy.');
-            }
-
-            // Naming
-            const lastName = fields.LastName || '';
-            const firstName = fields.FirstName || '';
-            const degreeLevel = fields.DegreeLevel || '';
-            const nationalCountry = fields.National_Country || '';
-            const studentId = fields['IDorTNum'] || ''; // Use the exact field name from the frontend!
-            const studentFolderName = `${lastName}_${firstName}_${degreeLevel}_${nationalCountry}`.replace(/[^a-zA-Z0-9_\-]/g, '_');
-            const baseFileNamePrefix = `${lastName}_${firstName}_${degreeLevel}_${studentId}_${nationalCountry}`.replace(/[^a-zA-Z0-9_\-]/g, '_');
-
-            // Google Auth (per-request)
-            const authClient = await auth.getClient();
-            const drive = google.drive({ version: 'v3', auth: authClient });
-            const sheets = google.sheets({ version: 'v4', auth: authClient });
-
-            // Find or create student folder
-            let studentFolderId = null;
-            const search = await drive.files.list({
-                q: `name='${studentFolderName}' and mimeType='application/vnd.google-apps.folder' and '${BASE_DRIVE_FOLDER_ID}' in parents`,
-                spaces: 'drive', fields: 'files(id, name)'
-            });
-            if (search.data.files.length > 0) {
-                studentFolderId = search.data.files[0].id;
-            } else {
-                const created = await drive.files.create({
-                    resource: {
-                        name: studentFolderName,
-                        mimeType: 'application/vnd.google-apps.folder',
-                        parents: [BASE_DRIVE_FOLDER_ID]
-                    },
-                    fields: 'id'
-                });
-                studentFolderId = created.data.id;
-            }
-
-            // Upload files
-            const driveLinks = {};
-            for (const fileInfo of uploadedFilesInfo) {
-                const fileCode = FILE_FIELDS_MAP[fileInfo.fieldname];
-                const thisCountry =
-                    fileInfo.fieldname === 'NationalID'
-                        ? nationalCountry
-                        : fields[`${fileCode}_Country`] || '';
-                const driveFileName = `${baseFileNamePrefix}_${fileCode}_${thisCountry}${path.extname(fileInfo.filename)}`;
-                const fileMeta = {
-                    name: driveFileName,
-                    parents: [studentFolderId]
-                };
-                const media = {
-                    mimeType: fileInfo.mimetype,
-                    body: fs.createReadStream(fileInfo.tempFilePath)
-                };
-                const uploadRes = await drive.files.create({
-                    resource: fileMeta,
-                    media,
-                    fields: 'id'
-                });
-                const fileId = uploadRes.data.id;
-                // Make file shareable (anyone with link can view)
-                await drive.permissions.create({
-                    fileId,
-                    requestBody: {
-                        role: 'reader',
-                        type: 'anyone'
-                    }
-                });
-                const webViewLink = `https://drive.google.com/file/d/${fileId}/view?usp=sharing`;
-                driveLinks[fileInfo.fieldname] = webViewLink;
-            }
-
-            // Write to Google Sheet
-            const sheetRow = [
-                fields.FirstName,
-                fields.MiddleName,
-                fields.LastName,
-                fields.AdditionalName,
-                fields.StudentType,
-                fields.DegreeLevel,
-                fields.Gender,
-                fields.BirthDate,
-                fields.PersonalEmail,
-                fields.Notes,
-                driveLinks.NationalID || '',
-                fields.National_Country,
-                driveLinks.Transcript1 || '',
-                fields.T1_Country,
-                driveLinks.Transcript2 || '',
-                fields.T2_Country,
-                driveLinks.Transcript3 || '',
-                fields.T3_Country,
-                driveLinks.Transcript4 || '',
-                fields.T4_Country,
-                fields.Terms_Conditions,
-                new Date().toISOString()
-            ];
-            await sheets.spreadsheets.values.append({
-                spreadsheetId: SPREADSHEET_ID,
-                range: `${SHEET_NAME}!B3`,
-                valueInputOption: 'RAW',
-                insertDataOption: 'INSERT_ROWS',
-                requestBody: {
-                    values: [sheetRow]
-                }
-            });
-
-            cleanupTempFiles(tempFilePaths);
-            return res.status(200).send({ success: true, message: 'Submission complete.' });
-        } catch (err) {
-            cleanupTempFiles(tempFilePaths);
-            functions.logger.error('Error during submission:', err);
-            return res.status(500).send('Backend error. Please try again.');
+      // UPLOAD FILES TO DRIVE
+      const driveLinks = {};
+      for (const field in FILE_FIELDS_MAP) {
+        if (!files[field]) continue;
+        
+        let fileIdentifier = "";
+        if (field === "nationalID") {
+          const countryCode = fields.nationalCountryCode || "";
+          fileIdentifier = `${countryCode}${FILE_FIELDS_MAP[field]}`; 
+        } else if (field.startsWith("transcript")) {
+          const num = field.slice(-1);
+          const countryCode = fields[`t${num}CountryCode`] || "";
+          fileIdentifier = `${countryCode}${FILE_FIELDS_MAP[field]}`;
         }
-    });
 
-    req.pipe(busboy);
+        const driveFileName = [
+          folderName,
+          fileIdentifier
+        ].filter(Boolean).join("-") + path.extname(files[field].filename);
+
+        const fileMeta = { name: driveFileName, parents: [folderId] };
+        const media = {
+          mimeType: files[field].mimetype,
+          body: fs.createReadStream(files[field].tempFilePath)
+        };
+        const uploadRes = await drive.files.create({
+          resource: fileMeta,
+          media,
+          fields: 'id'
+        });
+        const fileId = uploadRes.data.id;
+        await drive.permissions.create({
+          fileId,
+          requestBody: { role: 'reader', type: 'anyone' }
+        });
+        driveLinks[field] = `https://drive.google.com/file/d/${fileId}/view?usp=sharing`;
+      }
+
+      // WRITE TO SHEET
+      const sheetRow = [
+        fields.firstName, fields.middleName || "", fields.lastName, fields.additionalName || "",
+        fields.studentType, fields.degreeLevel, fields.gender, fields.birthDate,
+        fields.personalEmail, fields.notes || "", fields.termsConditions || "",
+        driveLinks.nationalID, fields.nationalCountry,
+        driveLinks.transcript1, fields.t1Country,
+        driveLinks.transcript2 || "", fields.t2Country || "",
+        driveLinks.transcript3 || "", fields.t3Country || "",
+        driveLinks.transcript4 || "", fields.t4Country || "",
+       
+        new Date().toISOString()
+      ];
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `${SHEET_NAME}!B4`,
+        valueInputOption: 'RAW',
+        insertDataOption: 'INSERT_ROWS',
+        requestBody: { values: [sheetRow] }
+      });
+
+      cleanupTempFiles(tempFilePaths);
+      res.status(200).json({ success: true, message: "Submitted!" });
+    } catch (err) {
+      cleanupTempFiles(tempFilePaths);
+      console.error(err);
+      res.status(500).json({ error: "Backend error. Please try again." });
+    }
+  });
+
+  req.pipe(busboy);
 });
