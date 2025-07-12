@@ -1,0 +1,8 @@
+{
+  "builds": [
+    { "src": "transcript-uploader/package.json", "use": "@vercel/next" }
+  ],
+  "routes": [
+    { "src": "/(.*)", "dest": "/transcript-uploader/$1" }
+  ]
+}
