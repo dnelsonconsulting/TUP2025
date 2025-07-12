@@ -145,7 +145,7 @@ export default function MultiStepForm() {
   return (
     <div className="m-10 p-10 bg-white rounded-2xl shadow-lg max-w-2xl w-full">
       {submitResult?.success ? (
-        <SuccessStep message={submitResult.success} />
+        <SuccessStep />
       ) : (
         <>
           {step === 0 && (
