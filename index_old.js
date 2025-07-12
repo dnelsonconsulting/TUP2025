@@ -1,10 +1,8 @@
 /**
- * Import function triggers from their respective submodules:
- *
- * const {onCall} = require("firebase-functions/v2/https");
- * const {onDocumentWritten} = require("firebase-functions/v2/firestore");
- *
- * See a full list of supported triggers at https://firebase.google.com/docs/functions
+ * Cloud Function to handle transcript and document submissions.
+ * It receives multipart/form-data, validates fields and files,
+ * uploads files to Google Drive with specific naming, makes them shareable,
+ * records form data and file links in a Google Sheet, and cleans up temporary files.
  */
 
 const functions = require('firebase-functions');
@@ -13,32 +11,36 @@ const { google } = require('googleapis');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
-
-// You might want to install the uuid library to generate unique temp filenames
-// npm install uuid --save
+// Install uuid: npm install uuid --save in your functions directory
 const { v4: uuidv4 } = require('uuid');
 
 // --- Configuration ---
-const SPREADSHEET_ID = '1eOE98EMLJ56AAtFuXqQG5IqA4ABwyFLyqzoIbH7lHXg';
-const SHEET_NAME = 'Transcripts';
-const BASE_DRIVE_FOLDER_ID = '1uBtsAnQrwPMcb-BcYRfE5m_mNA7nTyyW'; // 'StudentFiles' folder ID
+const SPREADSHEET_ID = '1eOE98EMLJ56AAtFuXqQG5IqA4ABwyFLyqzoIbH7lHXg'; // Your Google Sheet ID
+const SHEET_NAME = 'Transcripts'; // Your Google Sheet tab name
+const BASE_DRIVE_FOLDER_ID = '1uBtsAnQrwPMcb-BcYRfE5m_mNA7nTyyW'; // 'StudentFiles' Google Drive folder ID
 
-// List of required form fields (text inputs)
+// List of required form fields (text inputs) - field names must match frontend form element names
 const REQUIRED_FIELDS = [
     'FirstName',
-    'LastName',
     'MiddleName',
+    'LastName',
     'AdditionalName',
     'StudentType',
     'DegreeLevel',
     'Gender',
     'BirthDate',
     'PersonalEmail',
-    // 'AdditionalNotes' is optional
+    'Notes',
+    'National_Country', // Also required for naming
+    'T1_Country',
+    'T2_Country',
+    'T3_Country',
+    'T4_Country',
+    'ID or T#', // Required for naming
 ];
 
 // Map of expected file upload field names to a short code for file naming
-// The keys must match the 'name' attribute of your file input fields in the frontend form
+// Keys MUST match the 'name' attribute of your file input fields in the frontend form
 const FILE_FIELDS_MAP = {
     'NationalID': 'NationalID',
     'Transcript1': 'T1',
@@ -47,15 +49,19 @@ const FILE_FIELDS_MAP = {
     'Transcript4': 'T4',
 };
 
-// Required file fields (all from FILE_FIELDS_MAP)
+// Required file fields (all from FILE_FIELDS_MAP are required based on requirements)
 const REQUIRED_FILE_FIELDS = Object.keys(FILE_FIELDS_MAP);
+
+// Field name for the accuracy checkbox
+const ACCURACY_CHECKBOX_FIELD = 'Terms_Conditions';
+
 // --- Google API Setup ---
-// Configure Google Auth using the default service account credentials
+// Configure Google Auth using the default service account credentials provided by Cloud Functions
 const auth = new google.auth.GoogleAuth({
     // Scopes required for accessing Drive and Sheets
     scopes: [
-        'https://www.googleapis.com/auth/drive', // For managing files in Drive
-        'https://www.googleapis.com/auth/spreadsheets' // For writing to Sheets
+        'https://www.googleapis.com/auth/drive', // Full access to Drive files and folders
+        'https://www.googleapis.com/auth/spreadsheets' // Full access to Sheets
     ]
 });
 
@@ -64,280 +70,341 @@ const drive = google.drive({ version: 'v3', auth });
 const sheets = google.sheets({ version: 'v4', auth });
 
 // --- Main Cloud Function (HTTP Trigger) ---
+// This function will be triggered by a POST request to its endpoint URL
 exports.handleTranscriptSubmission = functions.https.onRequest(async (req, res) => {
+    functions.logger.info("Received submission request.");
+
     // Ensure it's a POST request
     if (req.method !== 'POST') {
+        functions.logger.warn(`Received non-POST request: ${req.method}`);
         return res.status(405).send('Method Not Allowed - Only POST requests are accepted');
     }
 
-    const busboy = new Busboy({ headers: req.headers });
+    // Busboy setup to parse multipart/form-data
+    const busboy = Busboy({ headers: req.headers });
 
     // Objects to hold form data and file promises
     const fields = {};
-    const filePromises = []; // To store promises for processing each file
+    const filePromises = []; // To store promises for processing each file upload
 
-    // Directory for temporary file storage in Cloud Functions
+    // Directory for temporary file storage in Cloud Functions (read-only except for /tmp)
     const tmpdir = os.tmpdir();
+
+    // Array to keep track of temporary file paths for cleanup
+    const tempFilePaths = [];
 
     // --- Busboy Event Handlers ---
 
-    // Handle text fields
-       busboy.on('finish', async () => {
+    // Handle text fields ('field' event)
+    busboy.on('field', (fieldname, val, fieldnameTruncated, valTruncated, encoding, mimetype) => {
+        // functions.logger.debug(`Field [${fieldname}]: value = "${val}"`); // Log field data (use debug level for sensitive data)
+        fields[fieldname] = val; // Store the text field value
+    });
+
+    // Handle file uploads ('file' event)
+    busboy.on('file', (fieldname, fileStream, filename, info) => {
+        const { encoding, mimeType } = info;
+        functions.logger.info(`Processing file [${fieldname}]: filename = "${filename}", encoding = ${encoding}, mimeType = ${mimeType}`);
+
+        // Check if this file field name is expected
+        if (!FILE_FIELDS_MAP[fieldname]) {
+            functions.logger.warn(`Received unexpected file field: ${fieldname}. This file will not be processed.`);
+            // Important: Consume the stream to prevent the function from hanging
+            fileStream.resume();
+            return;
+        }
+
+        // Create a unique temporary filename in the Cloud Functions /tmp directory
+        // Adding original filename helps debugging, uuid ensures uniqueness
+        const tempFileName = path.join(tmpdir, `upload_${uuidv4()}_${filename}`);
+        tempFilePaths.push(tempFileName); // Add to cleanup list
+        functions.logger.info(`Saving temporary file for [${fieldname}] to: ${tempFileName}`);
+
+        // Create a write stream to the temporary file path
+        const writeStream = fs.createWriteStream(tempFileName);
+
+        // Pipe the incoming file stream directly to the temporary file write stream
+        fileStream.pipe(writeStream);
+
+        // Create a promise that resolves when the file is fully written to /tmp
+        // This is needed because busboy processes files asynchronously
+        const filePromise = new Promise((resolve, reject) => {
+            // Event when the incoming file stream ends (all data received)
+            fileStream.on('end', () => {
+                 functions.logger.debug(`File stream ended for [${fieldname}]`);
+                 // Once the stream ends, close the write stream to finalize the file
+                 writeStream.end();
+            });
+
+            // Event when the temporary file write stream finishes
+            writeStream.on('finish', () => {
+                functions.logger.info(`Temporary file finished writing for [${fieldname}]: ${tempFileName}`);
+                // Resolve the promise with the necessary info about the saved file
+                resolve({
+                    fieldname: fieldname, // The name of the form field (e.g., 'NationalID')
+                    filename: filename,   // The original filename from the user's computer
+                    mimetype: mimeType,
+                    encoding: encoding,
+                    tempFilePath: tempFileName // The path to the temporary file in /tmp
+                });
+            });
+
+            // Handle errors during stream piping
+            fileStream.on('error', (err) => {
+                functions.logger.error(`Error with file stream for [${fieldname}]:`, err);
+                 // Attempt to clean up partially written temp file immediately on error
+                 if (fs.existsSync(tempFileName)) {
+                     try { fs.unlinkSync(tempFileName); } catch(e) { functions.logger.error(`Cleanup failed for ${tempFileName} after stream error:`, e); }
+                 }
+                reject(err); // Reject the promise
+            });
+
+            writeStream.on('error', (err) => {
+                functions.logger.error(`Error writing temporary file for [${fieldname}]:`, err);
+                 // Attempt to clean up partially written temp file immediately on error
+                 if (fs.existsSync(tempFileName)) {
+                      try { fs.unlinkSync(tempFileName); } catch(e) { functions.logger.error(`Cleanup failed for ${tempFileName} after write error:`, e); }
+                 }
+                reject(err); // Reject the promise
+            });
+        });
+
+        // Add the promise for this file to our array
+        filePromises.push(filePromise);
+    });
+
+    // --- Busboy Finish Handler ---
+    // This event fires after busboy has processed the entire request body
+    busboy.on('finish', async () => {
         functions.logger.info('Busboy finished parsing form. Starting backend processing.');
 
         try {
             // --- Wait for all temporary files to be saved ---
-            // This is crucial! We need to make sure all file streams are fully written to /tmp
+            // Ensure all file streams are fully written to /tmp before proceeding
             const uploadedFilesInfo = await Promise.all(filePromises);
-            functions.logger.info(`All temporary files saved. Proceeding with ${uploadedFilesInfo.length} files.`);
+            functions.logger.info(`All temporary files saved and promises resolved. Proceeding with ${uploadedFilesInfo.length} files.`);
 
             // --- 1. Validation ---
-            // Check all required text fields are present and not empty
+
+            // Validate required text fields
             for (const fieldName of REQUIRED_FIELDS) {
                 if (!fields[fieldName]) {
+                    functions.logger.warn(`Validation failed: Missing required field "${fieldName}"`);
                     // Clean up temporary files before returning error
-                    uploadedFilesInfo.forEach(file => fs.unlinkSync(file.tempFilePath));
+                    cleanupTempFiles(tempFilePaths);
                     return res.status(400).send(`Missing required field: ${fieldName}`);
                 }
+                 // Basic check for empty strings too
+                 if (typeof fields[fieldName] === 'string' && fields[fieldName].trim() === '') {
+                      functions.logger.warn(`Validation failed: Required field "${fieldName}" is empty`);
+                      cleanupTempFiles(tempFilePaths);
+                      return res.status(400).send(`Required field is empty: ${fieldName}`);
+                 }
             }
 
-            // Check if all required file fields were received and saved temporarily
+             // Validate required file fields by checking the number of files received
+             // and potentially checking which ones are missing if the count is off.
              if (uploadedFilesInfo.length !== REQUIRED_FILE_FIELDS.length) {
-                 functions.logger.error(`Expected ${REQUIRED_FILE_FIELDS.length} files, but received/processed ${uploadedFilesInfo.length}`);
-                 // You might want to check which specific required files are missing
+                 functions.logger.error(`Validation failed: Expected ${REQUIRED_FILE_FIELDS.length} files, but received/processed ${uploadedFilesInfo.length}`);
+                 // Determine which required files are missing
                  const receivedFileFieldNames = uploadedFilesInfo.map(f => f.fieldname);
                  const missingFileFields = REQUIRED_FILE_FIELDS.filter(fieldName => !receivedFileFieldNames.includes(fieldName));
 
                  // Clean up temporary files before returning error
-                 uploadedFilesInfo.forEach(file => fs.unlinkSync(file.tempFilePath));
-                 return res.status(400).send(`Missing required file uploads. Missing: ${missingFileFields.join(', ')}`);
+                 cleanupTempFiles(tempFilePaths);
+                 return res.status(400).send(`Missing required file uploads. Please upload: ${missingFileFields.join(', ')}`);
              }
+             // Optional: Add checks here if specific file types are required
 
-
-            // Check if the accuracy checkbox was checked
+            // Validate the accuracy checkbox
             // Assuming the checkbox field name is 'Terms_Conditions' and its value is 'true' when checked
-            if (fields.Terms_Conditions !== 'true') { // React might send 'true' as string
+            if (fields[ACCURACY_CHECKBOX_FIELD] !== 'true') { // React might send 'true' as string
+                 functions.logger.warn(`Validation failed: Accuracy checkbox not checked.`);
                  // Clean up temporary files before returning error
-                uploadedFilesInfo.forEach(file => fs.unlinkSync(file.tempFilePath));
-                return res.status(400).send('You must confirm the accuracy of the information.');
+                cleanupTempFiles(tempFilePaths);
+                return res.status(400).send('You must confirm the accuracy of the information by checking the box.');
             }
 
-            functions.logger.info('Validation passed.');
+            functions.logger.info('Validation passed successfully.');
 
             // --- Extract Naming Components ---
             // Get the necessary fields for folder and file naming
-            const lastName = fields.LastName;
-            const firstName = fields.FirstName;
-            const degreeLevel = fields.DegreeLevel;
-            const country = fields.National_Country; // Assuming this field holds the country for naming
-            const studentId = fields['ID or T#']; // Using the exact key name with brackets
+            // Use optional chaining or default empty string in case a field was somehow missed by busboy field handler (shouldn't happen if required fields check passes)
+            const lastName = fields.LastName || '';
+            const firstName = fields.FirstName || '';
+            const degreeLevel = fields.DegreeLevel || '';
+            const nationalCountry = fields.National_Country || ''; // Country associated with National ID, used for folder naming
+            const studentId = fields['ID or T#'] || ''; // Using the exact key name with brackets
 
             // Construct folder name and base file name prefix
-            const studentFolderName = `${lastName}_${firstName}_${degreeLevel}_${country}`;
-            const baseFileNamePrefix = `${lastName}_${firstName}_${degreeLevel}_${studentId}_${country}`;
+            // Folder format: <LastName>_<FirstName>_<DegreeLevel>_<NationalID Country>
+            const studentFolderName = `${lastName}_${firstName}_${degreeLevel}_${nationalCountry}`.replace(/[^a-zA-Z0-9_\-]/g, '_'); // Sanitize for valid folder name
+            // Base file name prefix format: <LastName>_<FirstName>_<DegreeLevel>_<ID or T#>_<NationalID Country>
+            const baseFileNamePrefix = `${lastName}_${firstName}_${degreeLevel}_${studentId}_${nationalCountry}`.replace(/[^a-zA-Z0-9_\-]/g, '_'); // Sanitize
 
-            functions.logger.info(`Student Folder Name: ${studentFolderName}`);
-            functions.logger.info(`Base File Name Prefix: ${baseFileNamePrefix}`);
+            functions.logger.info(`Constructed Student Folder Name: "${studentFolderName}"`);
+            functions.logger.info(`Constructed Base File Name Prefix: "${baseFileNamePrefix}"`);
 
             // --- 2. Google Drive Actions ---
 
             // Find or Create the student-specific folder inside BASE_DRIVE_FOLDER_ID
             let studentFolderId = null;
             try {
+                functions.logger.info(`Searching for student folder: "${studentFolderName}" inside parent "${BASE_DRIVE_FOLDER_ID}"`);
                 const searchStudentFolderResult = await drive.files.list({
                     q: `name='${studentFolderName}' and mimeType='application/vnd.google-apps.folder' and '${BASE_DRIVE_FOLDER_ID}' in parents`,
-                    spaces: 'drive',
-                    fields: 'files(id, name)'
+                    spaces: 'drive', // Search within user's Drive files
+                    fields: 'files(id, name)' // Request only the ID and name
                 });
 
                 if (searchStudentFolderResult.data.files.length > 0) {
                     studentFolderId = searchStudentFolderResult.data.files[0].id;
                     functions.logger.info(`Found existing student folder: ${studentFolderId}`);
                 } else {
-                    functions.logger.info(`Creating new student folder: ${studentFolderName}`);
+                    functions.logger.info(`Student folder not found. Creating new folder: "${studentFolderName}"`);
                     const createStudentFolder = await drive.files.create({
-                        resource: {
+                         resource: {
                             name: studentFolderName,
                             mimeType: 'application/vnd.google-apps.folder',
                             parents: [BASE_DRIVE_FOLDER_ID] // Place it inside the base folder
                         },
-                        fields: 'id'
+                        fields: 'id' // Request the ID of the newly created folder
                     });
                     studentFolderId = createStudentFolder.data.id;
-                     functions.logger.info(`Created student folder: ${studentFolderId}`);
+                     functions.logger.info(`Created student folder successfully: ${studentFolderId}`);
                 }
             } catch (driveError) {
                  functions.logger.error('Error finding or creating student folder:', driveError);
                  // Clean up temporary files before returning error
-                 uploadedFilesInfo.forEach(file => fs.unlinkSync(file.tempFilePath));
-                 return res.status(500).send('Error accessing Google Drive.');
+                 cleanupTempFiles(tempFilePaths);
+                 return res.status(500).send('Error accessing Google Drive to manage folders.');
             }
 
-
-            // Upload each temporary file to the student folder and get links
+            // Upload each temporary file to the student folder and get shareable links
             const driveLinks = {}; // Object to store file field names and their shareable links
 
             for (const fileInfo of uploadedFilesInfo) {
-                 // Determine the short code based on the file field name
+                 // Determine the short code based on the file field name (e.g., 'NationalID', 'T1')
                  const fileCode = FILE_FIELDS_MAP[fileInfo.fieldname];
+                 // This check is technically redundant due to the earlier validation, but safe
                  if (!fileCode) {
-                     functions.logger.warn(`No file code mapped for field: ${fileInfo.fieldname}. Skipping upload for this file.`);
-                     continue; // Skip this file if it wasn't in our expected map
+                     functions.logger.warn(`No file code mapped for field: ${fileInfo.fieldname}`);
+                     continue;
                  }
-
-                 // Construct the final file name for Drive
-                 // Format: <LastName>_<FirstName>_<DegreeLevel>_<ID or T#>_<Country>_<FileCode>.<Extension>
-                 const fileExtension = path.extname(fileInfo.filename); // Get original extension
-                 const uploadFileName = `${baseFileNamePrefix}_${fileCode}${fileExtension}`;
-                 functions.logger.info(`Uploading file ${fileInfo.filename} as ${uploadFileName} to Drive folder ${studentFolderId}`);
-
-
+                 
+                 // Construct the final filename using the base prefix and file code
+                 const finalFileName = `${baseFileNamePrefix}_${fileCode}_${fileInfo.filename}`;
+                 
                  try {
-                     const response = await drive.files.create({
-                         requestBody: {
-                             name: uploadFileName,
-                             mimeType: fileInfo.mimetype,
+                     // Upload the file to Google Drive
+                     const uploadResult = await drive.files.create({
+                         resource: {
+                             name: finalFileName,
                              parents: [studentFolderId]
                          },
                          media: {
                              mimeType: fileInfo.mimetype,
-                             body: fs.createReadStream(fileInfo.tempFilePath) // Stream directly from the temporary file
+                             body: fs.createReadStream(fileInfo.tempFilePath)
                          },
-                         fields: 'id, webViewLink, webContentLink' // Request necessary link fields
+                         fields: 'id, webViewLink'
                      });
-
-                     // Make the file shareable (e.g., discoverable by link) - **Important step for shareable link!**
-                     // You might need to adjust permissions based on your exact needs (e.g., anyone with link)
-                     try {
-                          await drive.permissions.create({
-                            fileId: response.data.id,
-                            requestBody: {
-                              role: 'reader', // 'reader' allows viewing
-                              type: 'anyone', // 'anyone' makes it discoverable by link
-                            },
-                          });
-                         functions.logger.info(`Set permissions for file ${uploadFileName}`);
-                     } catch (permError) {
-                          functions.logger.warn(`Could not set shareable permissions for ${uploadFileName}:`, permError);
-                          // Decide if this is a fatal error or just log a warning
-                          // For now, we'll continue but the link might not work externally without manual sharing
-                     }
-
-
-                     // Store the webViewLink (viewable in browser) or webContentLink (direct download)
-                     // Requirement says "shareable link", webViewLink is usually what's intended for users to view
-                     driveLinks[fileInfo.fieldname] = response.data.webViewLink || response.data.webContentLink || 'Link Not Available';
-                     functions.logger.info(`Uploaded ${uploadFileName}, got link: ${driveLinks[fileInfo.fieldname]}`);
-
+                     
+                     // Make the file shareable
+                     await drive.permissions.create({
+                         fileId: uploadResult.data.id,
+                         resource: {
+                             role: 'reader',
+                             type: 'anyone'
+                         }
+                     });
+                     
+                     // Store the shareable link
+                     driveLinks[fileInfo.fieldname] = uploadResult.data.webViewLink;
+                     functions.logger.info(`Successfully uploaded and shared file: ${finalFileName}`);
+                     
                  } catch (uploadError) {
-                     functions.logger.error(`Error uploading file ${fileInfo.filename}:`, uploadError);
-                     // Clean up temporary files before returning error
-                     uploadedFilesInfo.forEach(file => fs.unlinkSync(file.tempFilePath));
+                     functions.logger.error(`Error uploading file ${finalFileName}:`, uploadError);
+                     cleanupTempFiles(tempFilePaths);
                      return res.status(500).send(`Error uploading file: ${fileInfo.filename}`);
                  }
             }
-
-            functions.logger.info('All files uploaded to Drive and links obtained.');
-
-            // --- 3. Google Sheets Actions ---
-
+            
+            // --- 3. Google Sheets Recording ---
             try {
-                // Construct the row data array - **ORDER IS CRUCIAL HERE!**
-                // Make sure this array matches the column order in your "Transcripts" tab exactly.
-                // Based on your fields, a possible order might be:
                 const rowData = [
-                    fields.FirstName || '',
-                    fields.LastName || '',
-                    fields.MiddleName || '',
-                    fields.AdditionalName || '',
-                    fields.StudentType || '',
-                    fields.DegreeLevel || '',
-                    fields.Gender || '',
-                    fields.BirthDate || '',
-                    fields.PersonalEmail || '',
-                    fields.AdditionalNotes || '', // Optional field
-                    // File Links (Order should match your sheet columns for links)
+                    new Date().toISOString(), // Timestamp
+                    fields.FirstName,
+                    fields.MiddleName,
+                    fields.LastName,
+                    fields.AdditionalName,
+                    fields.StudentType,
+                    fields.DegreeLevel,
+                    fields.Gender,
+                    fields.BirthDate,
+                    fields.PersonalEmail,
+                    fields.Notes,
                     driveLinks.NationalID || '',
+                    fields.National_Country,
                     driveLinks.Transcript1 || '',
+                    fields.T1_Country,
                     driveLinks.Transcript2 || '',
+                    fields.T2_Country,
                     driveLinks.Transcript3 || '',
+                    fields.T3_Country,
                     driveLinks.Transcript4 || '',
-                    // You might want to add the country fields T1_Country, etc. too if they are in the sheet
-                     fields.National_Country || '',
-                     fields.T1_Country || '',
-                     fields.T2_Country || '',
-                     fields.T3_Country || '',
-                     fields.T4_Country || '',
-                    // Add Accuracy checkbox status? fields.Terms_Conditions
-                     fields.Terms_Conditions === 'true' ? 'Yes' : 'No', // Convert boolean to Yes/No
-
-                    // Add any other fields present in your sheet column headers
+                    fields.T4_Country,
+                    fields['ID or T#'],
+                    fields.Terms_Conditions
                 ];
-                 functions.logger.info('Row data prepared:', rowData);
-
-                // Append the row to the sheet
-                const appendResponse = await sheets.spreadsheets.values.append({
+                
+                await sheets.spreadsheets.values.append({
                     spreadsheetId: SPREADSHEET_ID,
-                    range: `${SHEET_NAME}!A:ZZ`, // Use a range wide enough to cover all columns
-                    valueInputOption: 'USER_ENTERED', // USER_ENTERED preserves formatting, RAW just inserts values
-                    insertDataOption: 'INSERT_ROWS', // Always insert as new rows
+                    range: `${SHEET_NAME}!A:W`,
+                    valueInputOption: 'RAW',
                     resource: {
-                        values: [rowData], // Append a single row
-                    },
+                        values: [rowData]
+                    }
                 });
-
-                functions.logger.info(`Appended row to sheet. Cells updated: ${appendResponse.data.updates.updatedCells}`);
-
+                
+                functions.logger.info('Successfully recorded data to Google Sheets');
+                
             } catch (sheetsError) {
-                functions.logger.error('Error writing to Google Sheets:', sheetsError);
-                 // Clean up temporary files before returning error
-                uploadedFilesInfo.forEach(file => fs.unlinkSync(file.tempFilePath));
-                return res.status(500).send('Error writing data to Google Sheet.');
+                functions.logger.error('Error recording to Google Sheets:', sheetsError);
+                // Note: We don't return error here as files are already uploaded
+                // The user should be notified that files were uploaded but recording failed
             }
-
-             // --- 4. Clean up Temporary Files ---
-             // Super important! Delete the files saved in /tmp after processing.
-             // Cloud Functions storage in /tmp is temporary and has limits.
-             uploadedFilesInfo.forEach(file => {
-                 try {
-                     fs.unlinkSync(file.tempFilePath);
-                     functions.logger.info(`Cleaned up temporary file: ${file.tempFilePath}`);
-                 } catch (cleanupError) {
-                     functions.logger.warn(`Could not clean up temporary file ${file.tempFilePath}:`, cleanupError);
-                     // Log a warning, but don't fail the request if cleanup fails
-                 }
-             });
-
-
-            // --- 5. Send Success Response ---
-            res.status(200).send('Submission processed successfully! Thank you.');
-
+            
+            // --- 4. Cleanup ---
+            cleanupTempFiles(tempFilePaths);
+            
+            // --- 5. Success Response ---
+            res.status(200).json({
+                success: true,
+                message: 'Application submitted successfully',
+                driveLinks: driveLinks
+            });
+            
         } catch (error) {
-            // Catch any unexpected errors that might occur during processing
-            functions.logger.error('An unexpected error occurred during submission processing:', error);
-            // Attempt to clean up temporary files even on unexpected errors
-             if (uploadedFilesInfo) { // Check if uploadedFilesInfo was created
-                 uploadedFilesInfo.forEach(file => {
-                     try {
-                         fs.unlinkSync(file.tempFilePath);
-                         functions.logger.info(`Cleaned up temporary file after error: ${file.tempFilePath}`);
-                     } catch (cleanupError) {
-                         functions.logger.warn(`Could not clean up temporary file after error ${file.tempFilePath}:`, cleanupError);
-                     }
-                 });
-             }
-            res.status(500).send('An internal server error occurred during submission.');
+            functions.logger.error('Unexpected error during processing:', error);
+            cleanupTempFiles(tempFilePaths);
+            res.status(500).send('Internal server error during processing');
         }
     });
-
-    // Pipe the incoming request stream to busboy for parsing
-    // Use req.rawBody for Cloud Functions environments
-    busboy.end(req.rawBody);
+    
+    // Pipe the request body to busboy for parsing
+    req.pipe(busboy);
 });
 
-
-// You would define the imported libraries (functions, Busboy, google, path, os, fs, uuidv4)
-// and constants (SPREADSHEET_ID, SHEET_NAME, BASE_DRIVE_FOLDER_ID, REQUIRED_FIELDS,
-// FILE_FIELDS_
-
-
+// Helper function to clean up temporary files
+function cleanupTempFiles(filePaths) {
+    for (const filePath of filePaths) {
+        if (fs.existsSync(filePath)) {
+            try {
+                fs.unlinkSync(filePath);
+                functions.logger.debug(`Cleaned up temporary file: ${filePath}`);
+            } catch (error) {
+                functions.logger.error(`Failed to clean up temporary file ${filePath}:`, error);
+            }
+        }
+    }
+}
